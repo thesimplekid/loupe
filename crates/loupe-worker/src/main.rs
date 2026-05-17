@@ -260,8 +260,14 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 
 	if claude {
 		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx.clone()));
-		scanners
-			.push(Arc::new(LlmCodeReviewScanner::new(backend).with_bkb(bkb_mcp_path.is_some())));
+		scanners.push(Arc::new(
+			LlmCodeReviewScanner::new(backend)
+				.with_bkb(bkb_mcp_path.is_some())
+				// Resumable scans: skip files already scanned at this
+				// commit and report each as it finishes, so a rate-
+				// limited scan resumes without re-spending tokens.
+				.with_progress_client(client.clone()),
+		));
 		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
 	} else {
 		tracing::info!(

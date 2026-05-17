@@ -16,7 +16,11 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: V1_INITIAL }];
+const MIGRATIONS: &[Migration] = &[
+	Migration { version: 1, sql: V1_INITIAL },
+	Migration { version: 2, sql: V2_SCAN_PROGRESS },
+	Migration { version: 3, sql: V3_RESUME_NOT_BEFORE },
+];
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {
@@ -267,6 +271,63 @@ CREATE TABLE scan_history (
 CREATE INDEX idx_history_repo ON scan_history(repo_id, finished_at DESC);
 "#;
 
+/// v2 — resumable scans.
+///
+/// `scan_file_progress` records, per `(repo_id, commit_sha,
+/// file_path)`, that a source file has been fully scanned at that
+/// commit. A scan that stops early on a rate limit leaves these rows
+/// behind; the next continuation reads them and skips the done files.
+/// Rows are pruned wholesale for a repo once a scan covers the commit
+/// completely (`jobs.partial = 0` Succeeded), so the table never grows
+/// unbounded. `job_id` is `ON DELETE SET NULL` (not CASCADE): progress
+/// must survive its originating job being reaped so a later run can
+/// still skip the work, while the zero-progress guard attributes rows
+/// to the job that wrote them via `job_id` for as long as it exists.
+///
+/// `jobs.partial` flags a Succeeded scan that did *not* cover the whole
+/// commit (rate-limited). The reaper ignores Succeeded rows, so a
+/// partial never trips `MAX_ATTEMPTS`; the scheduler reads this column
+/// to decide whether a continuation is owed. `continuation_stopped`
+/// makes the scheduler's zero-progress stall terminal and one-shot.
+const V2_SCAN_PROGRESS: &str = r#"
+CREATE TABLE scan_file_progress (
+    id          INTEGER PRIMARY KEY,
+    repo_id     INTEGER NOT NULL REFERENCES registered_repos(id) ON DELETE CASCADE,
+    commit_sha  TEXT    NOT NULL,
+    file_path   TEXT    NOT NULL,
+    scanned_at  INTEGER NOT NULL,
+    job_id      INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+    UNIQUE(repo_id, commit_sha, file_path)
+);
+CREATE INDEX idx_scan_progress_lookup ON scan_file_progress(repo_id, commit_sha);
+CREATE INDEX idx_scan_progress_job ON scan_file_progress(job_id);
+
+	ALTER TABLE jobs ADD COLUMN partial INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE jobs ADD COLUMN continuation_stopped INTEGER NOT NULL DEFAULT 0;
+
+	-- Free-form audit note on a scan-history row. NULL for a normal run;
+-- set (e.g. "scan stalled: rate limit prevented forward progress …")
+-- when the continuation scheduler gives up on a chain that can't make
+-- forward progress, so the stall is queryable in the scan history and
+-- not just a log line.
+ALTER TABLE scan_history ADD COLUMN note TEXT;
+"#;
+
+/// v3 — rate-limit-aware continuation scheduling.
+///
+/// `jobs.resume_not_before` carries the worker-side parsed reset-time
+/// hint from the LLM provider's "resets &lt;time&gt;" message. The
+/// continuation scheduler must not enqueue a follow-up before
+/// `max(finished_at + DEFAULT_CONTINUATION_BACKOFF_SECS,
+/// resume_not_before)`, so a 5-hour Claude Code session lockout no
+/// longer burns the zero-progress cap inside the lockout window.
+/// NULL means "no hint" — the scheduler falls back to the static
+/// backoff alone, preserving v2 behaviour. Defaults to NULL so
+/// existing rows mid-flight upgrade cleanly.
+const V3_RESUME_NOT_BEFORE: &str = r#"
+ALTER TABLE jobs ADD COLUMN resume_not_before INTEGER;
+"#;
+
 #[cfg(test)]
 mod tests {
 	use rusqlite::Connection;
@@ -318,6 +379,64 @@ mod tests {
 		apply_pending(&mut c).unwrap();
 		let v_after = current_schema_version(&c).unwrap();
 		assert_eq!(v_before, v_after);
+	}
+
+	#[test]
+	fn v2_adds_scan_progress_table_and_job_continuation_columns() {
+		let c = fresh();
+		assert!(current_schema_version(&c).unwrap() >= 2);
+		// scan_file_progress exists.
+		let has_table: bool = c
+			.query_row(
+				"SELECT EXISTS(SELECT 1 FROM sqlite_master
+				   WHERE type='table' AND name='scan_file_progress')",
+				[],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert!(has_table, "v2 must create scan_file_progress");
+		// jobs.partial / continuation_stopped exist and default to 0.
+		c.execute(
+			"INSERT INTO registered_repos
+			   (clone_url, host, owner, repo, scanner_config, reporting, created_at)
+			 VALUES ('u', 'github.com', 'o', 'r', '{}', '{\"kind\":\"github_issue\",\"target_owner\":\"o\",\"target_repo\":\"r\",\"pat_secret_id\":1}', 0)",
+			[],
+		)
+		.unwrap();
+		c.execute(
+			"INSERT INTO jobs (repo_id, kind, state, enqueued_at) VALUES (1, 'scan', 'queued', 0)",
+			[],
+		)
+		.unwrap();
+		let partial: i64 =
+			c.query_row("SELECT partial FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+		assert_eq!(partial, 0, "jobs.partial must default to 0");
+		let stopped: i64 = c
+			.query_row("SELECT continuation_stopped FROM jobs WHERE id = 1", [], |r| r.get(0))
+			.unwrap();
+		assert_eq!(stopped, 0, "jobs.continuation_stopped must default to 0");
+	}
+
+	#[test]
+	fn v3_adds_resume_not_before_column() {
+		let c = fresh();
+		assert!(current_schema_version(&c).unwrap() >= 3);
+		c.execute(
+			"INSERT INTO registered_repos
+			   (clone_url, host, owner, repo, scanner_config, reporting, created_at)
+			 VALUES ('u', 'github.com', 'o', 'r', '{}', '{\"kind\":\"github_issue\",\"target_owner\":\"o\",\"target_repo\":\"r\",\"pat_secret_id\":1}', 0)",
+			[],
+		)
+		.unwrap();
+		c.execute(
+			"INSERT INTO jobs (repo_id, kind, state, enqueued_at) VALUES (1, 'scan', 'queued', 0)",
+			[],
+		)
+		.unwrap();
+		let rnb: Option<i64> = c
+			.query_row("SELECT resume_not_before FROM jobs WHERE id = 1", [], |r| r.get(0))
+			.unwrap();
+		assert_eq!(rnb, None, "jobs.resume_not_before must default to NULL");
 	}
 
 	#[test]

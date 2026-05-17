@@ -18,17 +18,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatRequest, HeartbeatResponse, JobInfo,
-	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ScanRequest, ScanResponse,
-	VerdictSubmission, PROTOCOL_VERSION,
+	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ScanProgressList, ScanProgressReport,
+	ScanRequest, ScanResponse, VerdictSubmission, PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
-use loupe_storage::{findings, repos, secrets};
+use loupe_storage::{findings, repos, scan_progress, secrets};
 
 use crate::auth::AuthedWorker;
 use crate::reporters;
@@ -59,6 +59,16 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 		target_finding_id: row.target_finding_id,
 		attempts: row.attempts,
 		enqueued_at: row.enqueued_at,
+		// `partial` and `continuation_stopped` are how the server
+		// distinguishes a truly-done Succeeded scan from a
+		// rate-limited one that is awaiting (or no longer awaiting)
+		// an auto-continuation. Surfacing them here is what makes
+		// `GET /v1/jobs` and `loupe job list` honest about scans that
+		// look "succeeded" but still owe work.
+		partial: row.partial,
+		continuation_stopped: row.continuation_stopped,
+		finished_at: row.finished_at,
+		error: row.error.clone(),
 	}
 }
 
@@ -119,6 +129,41 @@ pub async fn get(
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
 		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no job with id {id}")))?;
 	Ok(Json(job_to_info(&row)))
+}
+
+/// `POST /v1/jobs/:id/cancel` — admin cancels queued/leased jobs. If
+/// the target is a succeeded-partial scan, stop its auto-continuation
+/// chain instead.
+pub async fn cancel(
+	State(state): State<AppState>, Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	let now = now_secs();
+	let job = state
+		.db
+		.with_conn(|c| Ok(jobs::get(c, id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
+		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no job with id {id}")))?;
+
+	match job.state {
+		JobState::Queued | JobState::Leased => {
+			let cancelled = state
+				.db
+				.with_conn(|c| Ok(jobs::cancel(c, id, now)?))
+				.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel job: {e}")))?;
+			if cancelled {
+				Ok(StatusCode::NO_CONTENT)
+			} else {
+				Err((StatusCode::CONFLICT, "job state changed before cancel".into()))
+			}
+		},
+		JobState::Succeeded if job.kind == JobKind::Scan && job.partial => {
+			state.db.with_conn(|c| Ok(jobs::stop_continuation(c, id)?)).map_err(|e| {
+				(StatusCode::INTERNAL_SERVER_ERROR, format!("stop continuation: {e}"))
+			})?;
+			Ok(StatusCode::NO_CONTENT)
+		},
+		_ => Err((StatusCode::CONFLICT, "job is already terminal".into())),
+	}
 }
 
 /// Maximum wait the server will honour on a single long-poll, even if
@@ -332,6 +377,90 @@ pub async fn submit_findings(
 	Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /v1/jobs/:id/scan-progress` — worker records source files it
+/// has fully scanned at a commit (scan jobs only). Same ownership
+/// guard as `submit_findings`: must be a leased scan job held by this
+/// worker. Best-effort on the worker side; the rows let a later
+/// continuation skip finished files. `repo_id` is taken from the job,
+/// never the body.
+pub async fn report_scan_progress(
+	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
+	Path(job_id): Path<i64>, Json(report): Json<ScanProgressReport>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	check_version(report.protocol_version)?;
+	let now = now_secs();
+
+	let row = state
+		.db
+		.with_conn(|c| Ok(jobs::get(c, job_id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
+		.ok_or((StatusCode::FORBIDDEN, "no leased scan job for this worker".into()))?;
+	if row.state != JobState::Leased || row.worker_id != Some(worker.id()) {
+		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
+	}
+	if row.kind != JobKind::Scan {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			"verify-kind jobs cannot report scan progress".into(),
+		));
+	}
+
+	state
+		.db
+		.with_conn(|c| {
+			let tx = c.transaction()?;
+			for f in &report.files {
+				scan_progress::mark_scanned(&tx, row.repo_id, &report.commit_sha, f, row.id, now)?;
+			}
+			tx.commit()?;
+			Ok(())
+		})
+		.map_err(|e: loupe_storage::Error| {
+			(StatusCode::INTERNAL_SERVER_ERROR, format!("record scan progress: {e}"))
+		})?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query string for `GET /v1/repos/:id/scan-progress`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ScanProgressQuery {
+	pub commit: String,
+}
+
+/// `GET /v1/repos/:repo_id/scan-progress?commit=<sha>` — the
+/// repo-relative paths already scanned at that commit. Open to admins
+/// and to workers holding an active lease for `:repo_id` (same guard
+/// as the prior-findings search route); the LLM scanner calls this
+/// before fan-out to skip finished files.
+pub async fn list_scan_progress(
+	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
+	Path(repo_id): Path<i64>, Query(qp): Query<ScanProgressQuery>,
+) -> Result<Json<ScanProgressList>, (StatusCode, String)> {
+	if !worker.is_admin() {
+		let now = now_secs();
+		let allowed = state
+			.db
+			.with_conn(|c| {
+				Ok(jobs::worker_has_active_lease_for_repo(c, worker.id(), repo_id, now)?)
+			})
+			.map_err(|e| {
+				(StatusCode::INTERNAL_SERVER_ERROR, format!("checking worker repo lease: {e}"))
+			})?;
+		if !allowed {
+			return Err((
+				StatusCode::FORBIDDEN,
+				format!("worker does not hold an active lease for repo {repo_id}"),
+			));
+		}
+	}
+	let files =
+		state
+			.db
+			.with_conn(|c| Ok(scan_progress::scanned_files(c, repo_id, &qp.commit)?))
+			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list scan progress: {e}")))?;
+	Ok(Json(ScanProgressList { protocol_version: PROTOCOL_VERSION, files }))
+}
+
 /// `POST /v1/jobs/:id/verdict` — worker submits a verdict (verify jobs only).
 pub async fn submit_verdict(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
@@ -493,9 +622,19 @@ pub async fn complete(
 	Path(job_id): Path<i64>, Json(req): Json<CompleteRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	check_version(req.protocol_version)?;
-	let new_state = match req.outcome {
-		CompleteOutcome::Succeeded => JobState::Succeeded,
-		CompleteOutcome::Failed => JobState::Failed,
+	// `Partial` = a rate-limited scan: it produced real findings
+	// (already submitted via MCP) but did NOT cover the whole commit.
+	// It maps to the `succeeded` job state with `partial = 1` so the
+	// reaper ignores it and `attempts` never trips MAX_ATTEMPTS, while
+	// the continuation scheduler reads the flag to know a resume is
+	// owed. Findings transition / verify-enqueue / dispatch all run
+	// exactly as for Succeeded; only the `last_scanned_sha` advance and
+	// the progress prune are withheld until a run covers the commit
+	// fully.
+	let (new_state, partial) = match req.outcome {
+		CompleteOutcome::Succeeded => (JobState::Succeeded, false),
+		CompleteOutcome::Partial => (JobState::Succeeded, true),
+		CompleteOutcome::Failed => (JobState::Failed, false),
 	};
 	let now = now_secs();
 
@@ -532,8 +671,10 @@ pub async fn complete(
 				job_id,
 				worker.id(),
 				new_state,
+				partial,
 				req.head_sha.as_deref(),
 				req.error.as_deref(),
+				req.resume_not_before,
 				now,
 			)?;
 			if !updated {
@@ -542,13 +683,26 @@ pub async fn complete(
 				return Ok(false);
 			}
 			if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan {
-				if let Some(sha) = req.head_sha.as_deref() {
-					tx.execute(
-						"UPDATE registered_repos
-						   SET last_scanned_sha = ?1, last_scanned_at = ?2
-						 WHERE id = ?3",
-						(sha, now, job.repo_id),
-					)?;
+				// A partial run did NOT cover the commit: do not advance
+				// `last_scanned_sha` and do not prune progress — the
+				// continuation needs the markers to skip done files, and
+				// the next incremental scan must not think this commit
+				// is fully scanned. A full Succeeded run is the opposite
+				// on both counts.
+				if !partial {
+					if let Some(sha) = req.head_sha.as_deref() {
+						tx.execute(
+							"UPDATE registered_repos
+							   SET last_scanned_sha = ?1, last_scanned_at = ?2
+							 WHERE id = ?3",
+							(sha, now, job.repo_id),
+						)?;
+					}
+					// Commit fully covered ⇒ the per-file progress
+					// markers have served their purpose. Drop them in
+					// the same tx as the sha advance so the table can't
+					// grow without bound across the repo's lifetime.
+					loupe_storage::scan_progress::prune_repo(&tx, job.repo_id)?;
 				}
 				tx.execute(
 					"INSERT INTO scan_history

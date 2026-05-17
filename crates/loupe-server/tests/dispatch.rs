@@ -408,6 +408,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 			outcome: CompleteOutcome::Succeeded,
 			head_sha: Some("abc123".into()),
 			error: None,
+			resume_not_before: None,
 		})
 		.send()
 		.await

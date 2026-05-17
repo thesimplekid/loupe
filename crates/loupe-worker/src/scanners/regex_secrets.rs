@@ -160,6 +160,8 @@ mod tests {
 			base_sha: None,
 			config: serde_json::Value::Null,
 			cancel: CancellationToken::new(),
+			rate_limited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+			resume_at: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
 		}
 	}
 

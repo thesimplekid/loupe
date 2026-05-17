@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -32,7 +32,7 @@ use super::mcp::{
 	bind_mcp_into_sandbox, mcp_serve_args, McpContext, BKB_API_URL, SANDBOX_BKB_MCP_BIN,
 	SANDBOX_LOUPE_BIN,
 };
-use super::{LlmBackend, LlmRequest, LlmResponse};
+use super::{looks_like_rate_limit, LlmBackend, LlmRequest, LlmResponse, RateLimited};
 use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "claude-cli";
@@ -131,6 +131,16 @@ fn is_claude_auth_error(error: &anyhow::Error) -> bool {
 	msg.contains("401")
 		&& (msg.contains("invalid authentication credentials")
 			|| msg.contains("failed to authenticate"))
+}
+
+/// Reference time for [`RateLimited::from_detail`]: we don't have a
+/// monotonic provider clock, so the parsed reset-time hint is
+/// anchored relative to the worker's wall-clock at the moment the
+/// rate limit was observed. A skewed worker clock just shifts the
+/// estimate by the same skew; the scheduler honours `resume_at` as a
+/// soft minimum and falls back to its static backoff otherwise.
+fn now_unix() -> i64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 pub struct ClaudeCliBackend {
@@ -352,11 +362,44 @@ impl ClaudeCliBackend {
 				truncate(&stderr_text, 400),
 				truncate(&stdout_text, 400),
 			);
+			// A provider rate limit is a *soft* stop: the scan should
+			// checkpoint and resume, not hard-fail. The
+			// `loupe::rate_limit` target is a stable, greppable canary —
+			// its absence across runs that should have rate-limited is
+			// the alert that this heuristic has silently broken after a
+			// CLI output-format change. Do not rename it.
+			if looks_like_rate_limit(&combined) {
+				tracing::warn!(
+					target: "loupe::rate_limit",
+					backend = BACKEND_ID,
+					exit = ?status.code(),
+					detail = %combined,
+					"claude-cli: provider rate limit detected; scan will checkpoint and resume",
+				);
+				return Err(anyhow::Error::new(RateLimited::from_detail(combined, now_unix())));
+			}
 			return Err(anyhow!("claude CLI exited with {}: {}", status, combined));
 		}
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
+		// Exit 0 but no output: the CLI sometimes prints "rate-limit
+		// hit, retrying" to stderr and then gives up cleanly. Treat an
+		// empty result accompanied by a rate-limit message as rate
+		// limited (same soft-stop path), not as "zero findings".
+		if text.trim().is_empty() {
+			let stderr_text = String::from_utf8_lossy(&stderr);
+			if looks_like_rate_limit(&stderr_text) {
+				let detail = truncate(&stderr_text, 400);
+				tracing::warn!(
+					target: "loupe::rate_limit",
+					backend = BACKEND_ID,
+					detail = %detail,
+					"claude-cli: empty output after a rate-limit message; treating as rate limited",
+				);
+				return Err(anyhow::Error::new(RateLimited::from_detail(detail, now_unix())));
+			}
+		}
 		// Debug instrumentation hooks (no-ops when env vars unset):
 		//
 		// - LOUPE_LOG_AGENT_OUTPUT=1 dumps the full agent stdout/stderr at

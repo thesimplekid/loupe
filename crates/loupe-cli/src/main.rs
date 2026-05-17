@@ -221,7 +221,13 @@ struct WorkerRegisterArgs {
 #[derive(Debug, Subcommand)]
 enum JobCmd {
 	List,
-	Get { id: i64 },
+	Get {
+		id: i64,
+	},
+	/// Cancel a queued/leased job, or stop auto-resume for a partial job.
+	Cancel {
+		id: i64,
+	},
 }
 
 #[derive(Debug, Subcommand)]
@@ -343,6 +349,10 @@ async fn main() -> Result<()> {
 				let (client, base) = client_and_url(&conn)?;
 				job_get(&client, base, id).await
 			},
+			JobCmd::Cancel { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				job_cancel(&client, base, id).await
+			},
 		},
 		Cmd::Finding(c) => match c {
 			FindingCmd::List { repo_id } => {
@@ -448,6 +458,27 @@ fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
 	base.join(path).expect("path is always valid")
 }
 
+/// Translate a reqwest response into an error that includes the
+/// server's response body, not just the HTTP status. `reqwest`'s
+/// built-in `error_for_status` discards the body, which hides the
+/// helpful "no job with id 48"-style detail loupe-server returns on
+/// 4xx/5xx. Replaces every former `resp.error_for_status()?` site.
+async fn ensure_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
+	let status = resp.status();
+	if status.is_success() {
+		return Ok(resp);
+	}
+	// Capture the URL before `text().await` consumes the response.
+	let url = resp.url().as_str().to_owned();
+	let body = resp.text().await.unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+	let body = body.trim();
+	if body.is_empty() {
+		Err(anyhow::anyhow!("HTTP {} from {}", status, url))
+	} else {
+		Err(anyhow::anyhow!("HTTP {} from {}: {}", status, url, body))
+	}
+}
+
 async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
 	let require_approval = match (a.require_approval, a.no_require_approval) {
 		(true, false) => Some(true),
@@ -492,7 +523,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 
 async fn repo_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
 	let resp = client.get(url(base, "/v1/repos")).send().await?;
-	let body: ListReposResponse = resp.error_for_status()?.json().await?;
+	let body: ListReposResponse = ensure_ok(resp).await?.json().await?;
 	for r in body.repos {
 		let approval = r.require_approval.map_or("inherit".to_owned(), |v| v.to_string());
 		let disabled = r.disabled_at.map_or("active".to_owned(), |ts| format!("disabled@{ts}"));
@@ -514,7 +545,7 @@ async fn repo_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> 
 
 async fn repo_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.delete(url(base, &format!("/v1/repos/{id}"))).send().await?;
-	resp.error_for_status()?;
+	ensure_ok(resp).await?;
 	Ok(())
 }
 
@@ -703,17 +734,29 @@ fn server_cert_env_assignments(bundle: &loupe_tls::CertBundle) -> Vec<(&'static 
 
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.delete(url(base, &format!("/v1/workers/{id}"))).send().await?;
-	resp.error_for_status()?;
+	ensure_ok(resp).await?;
 	Ok(())
 }
 
 async fn job_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
 	let resp = client.get(url(base, "/v1/jobs")).send().await?;
-	let jobs: Vec<JobInfo> = resp.error_for_status()?.json().await?;
+	let jobs: Vec<JobInfo> = ensure_ok(resp).await?.json().await?;
 	for j in jobs {
+		// A rate-limited scan stores state=Succeeded with partial=1
+		// while a continuation is owed. Surface that so the row
+		// doesn't masquerade as a fully-finished scan.
+		let state_display = match (j.state, j.partial, j.continuation_stopped) {
+			(loupe_core::JobState::Succeeded, true, true) => {
+				format!("{:?}(partial,stopped)", j.state)
+			},
+			(loupe_core::JobState::Succeeded, true, false) => {
+				format!("{:?}(partial)", j.state)
+			},
+			_ => format!("{:?}", j.state),
+		};
 		println!(
-			"{:>4}\trepo={}\tkind={:?}\tstate={:?}\tattempts={}\thead={:?}",
-			j.job_id, j.repo_id, j.kind, j.state, j.attempts, j.head_sha,
+			"{:>4}\trepo={}\tkind={:?}\tstate={}\tattempts={}\thead={:?}",
+			j.job_id, j.repo_id, j.kind, state_display, j.attempts, j.head_sha,
 		);
 	}
 	Ok(())
@@ -721,14 +764,21 @@ async fn job_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
 
 async fn job_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/jobs/{id}"))).send().await?;
-	let job: JobInfo = resp.error_for_status()?.json().await?;
+	let job: JobInfo = ensure_ok(resp).await?.json().await?;
 	println!("{}", serde_json::to_string_pretty(&job)?);
+	Ok(())
+}
+
+async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/jobs/{id}/cancel"))).send().await?;
+	ensure_ok(resp).await?;
+	println!("cancelled job {id}");
 	Ok(())
 }
 
 async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i64) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))).send().await?;
-	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
+	let body: ListFindingsResponse = ensure_ok(resp).await?.json().await?;
 	for f in body.findings {
 		let loc = match (f.file_path.as_deref(), f.line_start) {
 			(Some(p), Some(l)) => format!("{p}:{l}"),
@@ -755,7 +805,7 @@ async fn finding_search(
 ) -> Result<()> {
 	let url = url(base, &format!("/v1/repos/{repo_id}/findings/search"));
 	let resp = client.get(url).query(&[("q", query), ("limit", &limit.to_string())]).send().await?;
-	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
+	let body: ListFindingsResponse = ensure_ok(resp).await?.json().await?;
 	if body.findings.is_empty() {
 		println!("(no matches)");
 		return Ok(());
@@ -778,7 +828,7 @@ async fn finding_show(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64, as_json: bool,
 ) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/findings/{id}"))).send().await?;
-	let detail: FindingDetail = resp.error_for_status()?.json().await?;
+	let detail: FindingDetail = ensure_ok(resp).await?.json().await?;
 	if as_json {
 		println!("{}", serde_json::to_string_pretty(&detail)?);
 	} else {

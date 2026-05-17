@@ -34,6 +34,23 @@ pub struct JobRow {
 	pub started_at: Option<i64>,
 	pub finished_at: Option<i64>,
 	pub error: Option<String>,
+	/// Set when a Succeeded scan did *not* cover the whole commit
+	/// (it stopped early on a rate limit). The reaper ignores
+	/// Succeeded rows so this never trips `MAX_ATTEMPTS`; the
+	/// scheduler reads it to decide whether a continuation is owed.
+	pub partial: bool,
+	/// Set when the continuation scheduler has stopped auto-resuming a
+	/// partial scan chain because it made no forward progress repeatedly.
+	/// This keeps the stall signal one-shot instead of re-emitting on
+	/// every scheduler tick.
+	pub continuation_stopped: bool,
+	/// Worker-side parsed reset-time hint from the LLM provider's
+	/// "resets &lt;time&gt;" message, in Unix seconds. Only set on a
+	/// succeeded-partial scan; `None` means the worker had no hint
+	/// (or this is a non-scan job) and the scheduler falls back to
+	/// its static backoff. See [`resumable_partials`] for how this
+	/// gates continuation scheduling.
+	pub resume_not_before: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,9 +112,10 @@ pub fn lease_next(
 		     ORDER BY enqueued_at ASC
 		     LIMIT 1
 		 )
-		 RETURNING id, repo_id, kind, state, incremental, since_sha, head_sha,
-		           parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		           attempts, enqueued_at, started_at, finished_at, error",
+			 RETURNING id, repo_id, kind, state, incremental, since_sha, head_sha,
+			           parent_job_id, target_finding_id, worker_id, lease_expires_at,
+			           attempts, enqueued_at, started_at, finished_at, error, partial,
+			           continuation_stopped, resume_not_before",
 	)?;
 	let mut iter =
 		stmt.query_map(params![worker_id, lease_until, now, accepts_verify as i64], row_to_job)?;
@@ -124,20 +142,73 @@ pub fn heartbeat(
 }
 
 /// Mark a leased job as complete. Caller picks the new state
-/// (`succeeded` or `failed`).
+/// (`succeeded` or `failed`). `partial` records a Succeeded scan that
+/// stopped early on a rate limit and therefore did not cover the whole
+/// commit; it is meaningless for `failed` and callers pass `false`
+/// there. `resume_not_before` is the worker's parsed reset-time hint
+/// in Unix seconds — only stored when `partial = true`; `None` means
+/// no hint (scheduler falls back to its static backoff). The hint is
+/// `COALESCE`d in so a later partial-complete on the same row (should
+/// not happen today, but defends against it) doesn't drop an earlier
+/// hint.
+#[allow(clippy::too_many_arguments)]
 pub fn complete(
-	conn: &Connection, job_id: i64, worker_id: i64, new_state: JobState, head_sha: Option<&str>,
-	error: Option<&str>, now: i64,
+	conn: &Connection, job_id: i64, worker_id: i64, new_state: JobState, partial: bool,
+	head_sha: Option<&str>, error: Option<&str>, resume_not_before: Option<i64>, now: i64,
 ) -> rusqlite::Result<bool> {
+	// `resume_not_before` is only meaningful with partial=true: a
+	// Failed or non-partial Succeeded job will never be considered
+	// for an auto-continuation, so the column staying NULL there
+	// keeps `jobs` rows honest under inspection.
+	let resume = if partial { resume_not_before } else { None };
 	let n = conn.execute(
 		"UPDATE jobs
 		   SET state = ?1,
-		       head_sha = COALESCE(?2, head_sha),
-		       error = ?3,
-		       finished_at = ?4,
+		       partial = ?2,
+		       head_sha = COALESCE(?3, head_sha),
+		       error = ?4,
+		       finished_at = ?5,
+		       resume_not_before = ?6,
 		       lease_expires_at = NULL
-		 WHERE id = ?5 AND state = 'leased' AND worker_id = ?6",
-		params![new_state.as_str(), head_sha, error, now, job_id, worker_id],
+		 WHERE id = ?7 AND state = 'leased' AND worker_id = ?8",
+		params![
+			new_state.as_str(),
+			partial as i64,
+			head_sha,
+			error,
+			now,
+			resume,
+			job_id,
+			worker_id,
+		],
+	)?;
+	Ok(n > 0)
+}
+
+/// Mark a partial scan job as no longer eligible for automatic
+/// continuation. Returns `true` when this call changed the row.
+pub fn stop_continuation(conn: &Connection, job_id: i64) -> rusqlite::Result<bool> {
+	let n = conn.execute(
+		"UPDATE jobs
+		   SET continuation_stopped = 1
+		 WHERE id = ?1 AND continuation_stopped = 0",
+		params![job_id],
+	)?;
+	Ok(n > 0)
+}
+
+/// Admin cancellation. Queued jobs will never be leased after this;
+/// leased jobs stop accepting heartbeats / completion from the worker.
+pub fn cancel(conn: &Connection, job_id: i64, now: i64) -> rusqlite::Result<bool> {
+	let n = conn.execute(
+		"UPDATE jobs
+		   SET state = 'cancelled',
+		       worker_id = NULL,
+		       lease_expires_at = NULL,
+		       finished_at = ?1,
+		       error = COALESCE(error, 'cancelled by admin')
+		 WHERE id = ?2 AND state IN ('queued','leased')",
+		params![now, job_id],
 	)?;
 	Ok(n > 0)
 }
@@ -146,7 +217,8 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	conn.query_row(
 		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
 		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		        attempts, enqueued_at, started_at, finished_at, error
+		        attempts, enqueued_at, started_at, finished_at, error, partial,
+		        continuation_stopped, resume_not_before
 		 FROM jobs WHERE id = ?1",
 		params![id],
 		row_to_job,
@@ -158,7 +230,8 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<JobRow>> {
 	let mut stmt = conn.prepare(
 		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
 		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		        attempts, enqueued_at, started_at, finished_at, error
+		        attempts, enqueued_at, started_at, finished_at, error, partial,
+		        continuation_stopped, resume_not_before
 		 FROM jobs
 		 ORDER BY enqueued_at DESC, id DESC",
 	)?;
@@ -176,6 +249,52 @@ pub fn count_active_scans_for_repo(conn: &Connection, repo_id: i64) -> rusqlite:
 		params![repo_id],
 		|r| r.get(0),
 	)
+}
+
+/// Repos owed a rate-limit continuation: the repo's *most recent*
+/// scan job is a succeeded-partial run, it has cooled off
+/// (`finished_at + backoff_secs <= now` AND the worker-supplied
+/// `resume_not_before` hint, if any, has passed), and no scan is
+/// currently queued or leased for the repo. Returns those partial
+/// `JobRow`s (one per such repo) so the scheduler can enqueue a
+/// continuation parented to each.
+///
+/// The `resume_not_before` clause is what stops the continuation
+/// chain from burning zero-progress slots inside a multi-hour Claude
+/// Code session lockout: when the worker parsed the provider's
+/// "resets &lt;time&gt;" hint, the chain waits at least until then.
+/// NULL preserves v2 behaviour (backoff-only scheduling).
+///
+/// "Most recent scan job" is `MAX(id)` for the repo: a newer
+/// queued/leased scan would have a higher id and so both fails this
+/// test and is caught by the `NOT EXISTS` active-scan guard — together
+/// they make the continuation idempotent against the periodic
+/// scheduler and against itself across ticks.
+pub fn resumable_partials(
+	conn: &Connection, now: i64, backoff_secs: i64,
+) -> rusqlite::Result<Vec<JobRow>> {
+	let mut stmt = conn.prepare(
+		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
+		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
+		        attempts, enqueued_at, started_at, finished_at, error, partial,
+		        continuation_stopped, resume_not_before
+			 FROM jobs j
+			 WHERE j.kind = 'scan'
+			   AND j.state = 'succeeded'
+			   AND j.partial = 1
+			   AND j.continuation_stopped = 0
+		   AND j.finished_at IS NOT NULL
+		   AND j.finished_at + ?1 <= ?2
+		   AND COALESCE(j.resume_not_before, 0) <= ?2
+		   AND j.id = (SELECT MAX(id) FROM jobs j2
+		                WHERE j2.repo_id = j.repo_id AND j2.kind = 'scan')
+		   AND NOT EXISTS (SELECT 1 FROM jobs j3
+		                    WHERE j3.repo_id = j.repo_id AND j3.kind = 'scan'
+		                      AND j3.state IN ('queued','leased'))
+		 ORDER BY j.repo_id ASC",
+	)?;
+	let rows = stmt.query_map(params![backoff_secs, now], row_to_job)?;
+	rows.collect()
 }
 
 /// Whether `worker_id` currently holds a non-expired lease for any job
@@ -255,6 +374,9 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 		started_at: row.get(13)?,
 		finished_at: row.get(14)?,
 		error: row.get(15)?,
+		partial: row.get::<_, i64>(16)? != 0,
+		continuation_stopped: row.get::<_, i64>(17)? != 0,
+		resume_not_before: row.get(18)?,
 	})
 }
 
@@ -470,6 +592,77 @@ mod tests {
 	}
 
 	#[test]
+	fn cancel_queued_job_prevents_lease() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let job_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					0,
+				)?)
+			})
+			.unwrap();
+
+		assert!(db.with_conn(|c| Ok(cancel(c, job_id, 50)?)).unwrap());
+		let row = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		assert_eq!(row.state, JobState::Cancelled);
+		assert_eq!(row.finished_at, Some(50));
+		assert_eq!(row.error.as_deref(), Some("cancelled by admin"));
+		assert!(db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().is_none());
+	}
+
+	#[test]
+	fn cancel_leased_job_invalidates_heartbeat_and_complete() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
+
+		assert!(db.with_conn(|c| Ok(cancel(c, leased.id, 150)?)).unwrap());
+		assert_eq!(
+			db.with_conn(|c| Ok(heartbeat(c, leased.id, worker_id, 160, 60)?)).unwrap(),
+			None
+		);
+		assert!(!db
+			.with_conn(|c| {
+				Ok(complete(
+					c,
+					leased.id,
+					worker_id,
+					JobState::Succeeded,
+					false,
+					Some("abc"),
+					None,
+					None,
+					170,
+				)?)
+			})
+			.unwrap());
+	}
+
+	#[test]
 	fn active_lease_lookup_is_worker_repo_and_expiry_scoped() {
 		let (db, repo_id, worker_id) = db_with_repo_and_worker();
 		let job_id = db
@@ -530,7 +723,17 @@ mod tests {
 			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
 		let ok = db
 			.with_conn(|c| {
-				Ok(complete(c, leased.id, worker_id, JobState::Succeeded, Some("abc"), None, 200)?)
+				Ok(complete(
+					c,
+					leased.id,
+					worker_id,
+					JobState::Succeeded,
+					false,
+					Some("abc"),
+					None,
+					None,
+					200,
+				)?)
 			})
 			.unwrap();
 		assert!(ok);
@@ -538,6 +741,145 @@ mod tests {
 		assert_eq!(row.state, JobState::Succeeded);
 		assert_eq!(row.head_sha.as_deref(), Some("abc"));
 		assert_eq!(row.finished_at, Some(200));
+		assert!(!row.partial, "a normal Succeeded scan is not partial");
+	}
+
+	#[test]
+	fn complete_partial_marks_succeeded_with_partial_flag() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
+		let ok = db
+			.with_conn(|c| {
+				Ok(complete(
+					c,
+					leased.id,
+					worker_id,
+					JobState::Succeeded,
+					true,
+					Some("def"),
+					None,
+					None,
+					200,
+				)?)
+			})
+			.unwrap();
+		assert!(ok);
+		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		assert_eq!(row.state, JobState::Succeeded, "partial maps to succeeded state");
+		assert!(row.partial, "partial flag must be set");
+		// The reaper only touches leased rows, so a partial (succeeded)
+		// can never trip MAX_ATTEMPTS.
+		let reaped = db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
+		assert_eq!(reaped, 0);
+		assert_eq!(db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap().attempts, 1);
+	}
+
+	#[test]
+	fn complete_partial_persists_resume_not_before_hint() {
+		// A partial complete that includes a parsed reset-time hint
+		// must persist it on the row, and `resumable_partials` must
+		// honour it as a soft scheduling floor on top of the static
+		// backoff.
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
+		db.with_conn(|c| {
+			Ok(complete(
+				c,
+				leased.id,
+				worker_id,
+				JobState::Succeeded,
+				true,
+				Some("sha"),
+				None,
+				Some(5_000),
+				1_000,
+			)?)
+		})
+		.unwrap();
+		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		assert_eq!(row.resume_not_before, Some(5_000));
+
+		// Static backoff (900) elapsed at 1_900, but the hint defers
+		// to 5_000. resumable_partials must respect the later of the
+		// two.
+		let r = db.with_conn(|c| Ok(resumable_partials(c, 4_999, 900)?)).unwrap();
+		assert!(r.is_empty(), "hint not yet elapsed");
+		let r = db.with_conn(|c| Ok(resumable_partials(c, 5_000, 900)?)).unwrap();
+		assert_eq!(r.len(), 1, "hint elapsed ⇒ resumable");
+	}
+
+	#[test]
+	fn complete_non_partial_discards_resume_hint() {
+		// `resume_not_before` only matters for partial completions;
+		// a clean Succeeded must NOT carry over any hint the caller
+		// may have erroneously passed, so the column stays NULL and
+		// inspection / scheduling stay honest.
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 60)?)).unwrap().unwrap();
+		db.with_conn(|c| {
+			Ok(complete(
+				c,
+				leased.id,
+				worker_id,
+				JobState::Succeeded,
+				false,
+				Some("sha"),
+				None,
+				Some(5_000),
+				1_000,
+			)?)
+		})
+		.unwrap();
+		let row = db.with_conn(|c| Ok(get(c, leased.id)?)).unwrap().unwrap();
+		assert_eq!(row.resume_not_before, None, "hint must be dropped on non-partial");
 	}
 
 	#[test]

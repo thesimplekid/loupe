@@ -5,6 +5,8 @@
 //! trait.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use loupe_core::{Finding, RepoSpec, Verdict};
@@ -57,6 +59,55 @@ pub struct ScanContext {
 	pub base_sha: Option<String>,
 	pub config: serde_json::Value,
 	pub cancel: CancellationToken,
+	/// Raised by the LLM scanner when a per-file agent session failed
+	/// with a provider rate limit. The runner reads it after `scan()`
+	/// returns: if set, the job is reported as `Partial` (server
+	/// checkpoints progress and schedules an auto-continuation) rather
+	/// than `Succeeded`. Runner-owned `Arc` so the scanner can flip it
+	/// from inside the per-file fan-out; non-LLM scanners ignore it.
+	pub rate_limited: Arc<AtomicBool>,
+	/// Earliest Unix-seconds instant at which a rate-limited
+	/// continuation should resume, parsed from the provider's
+	/// "resets &lt;time&gt;" hint (see
+	/// [`crate::llm::parse_reset_hint`]). `0` is the sentinel for
+	/// "no hint" / "unset"; the scanner writes the *minimum* observed
+	/// resume time across per-file sessions via
+	/// [`record_resume_at`](Self::record_resume_at). The runner reads
+	/// it after `scan()` returns and threads it into the partial-
+	/// completion report so the server scheduler can defer the
+	/// continuation past the lockout window rather than retrying
+	/// every 15 minutes inside it. Non-LLM scanners ignore.
+	pub resume_at: Arc<AtomicI64>,
+}
+
+impl ScanContext {
+	/// Record a parsed resume-time hint from a rate-limited LLM
+	/// session. Keeps the *earliest* hint seen so a single per-file
+	/// session that knows "the limit resets in 30 min" wins over a
+	/// peer that only saw a vague 429 with no hint. Pass `None` for
+	/// no-hint sessions (a no-op).
+	pub fn record_resume_at(&self, candidate: Option<i64>) {
+		let Some(c) = candidate else { return };
+		if c <= 0 {
+			return;
+		}
+		let mut cur = self.resume_at.load(std::sync::atomic::Ordering::SeqCst);
+		loop {
+			let new = if cur == 0 || c < cur { c } else { cur };
+			if new == cur {
+				return;
+			}
+			match self.resume_at.compare_exchange(
+				cur,
+				new,
+				std::sync::atomic::Ordering::SeqCst,
+				std::sync::atomic::Ordering::SeqCst,
+			) {
+				Ok(_) => return,
+				Err(actual) => cur = actual,
+			}
+		}
+	}
 }
 
 pub struct VerifyContext {

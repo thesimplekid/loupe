@@ -278,6 +278,7 @@ async fn end_to_end_scan_lifecycle() {
 			outcome: CompleteOutcome::Succeeded,
 			head_sha: Some("abc123".into()),
 			error: None,
+			resume_not_before: None,
 		})
 		.send()
 		.await
@@ -512,5 +513,80 @@ async fn empty_queue_returns_empty_lease_response() {
 	assert!(resp.status().is_success());
 	let body: LeaseResponse = resp.json().await.unwrap();
 	assert!(matches!(body, LeaseResponse::Empty { .. }));
+	f.handle.shutdown().await;
+}
+
+/// Regression test for the "looks succeeded but actually waiting on a
+/// continuation" surface bug: when a worker completes a rate-limited
+/// scan with `CompleteOutcome::Partial`, the row is stored as
+/// `state=succeeded, partial=true` so the reaper and `attempts`
+/// machinery leave it alone. Both `GET /v1/jobs` and
+/// `GET /v1/jobs/:id` must expose the `partial` flag (and
+/// `continuation_stopped`), otherwise the CLI / API can't distinguish
+/// a fully-finished scan from one that still owes work.
+#[tokio::test]
+async fn partial_complete_surfaces_partial_flag_in_listing() {
+	use loupe_proto::JobInfo;
+
+	let f = bring_up_with_repo_and_worker().await;
+
+	// Admin enqueues a scan; worker leases it.
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.job_id, scan.job_id);
+
+	// Complete with Partial — i.e. a rate-limited stop.
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Partial,
+			head_sha: Some("deadbeef".into()),
+			error: None,
+			resume_not_before: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	// GET /v1/jobs/:id — parse strongly-typed AND as raw JSON so we
+	// catch both wire shape and deserialization regressions.
+	let resp =
+		f.admin.get(format!("https://loupe-server/v1/jobs/{}", scan.job_id)).send().await.unwrap();
+	assert!(resp.status().is_success());
+	let raw = resp.json::<serde_json::Value>().await.unwrap();
+	assert_eq!(raw["state"], "succeeded", "DB state remains succeeded for partial scans");
+	assert_eq!(
+		raw["partial"], true,
+		"partial flag MUST be on the wire so clients can distinguish from a real succeeded scan"
+	);
+	assert_eq!(raw["continuation_stopped"], false);
+	assert_eq!(raw["head_sha"], "deadbeef");
+
+	// And via the strongly-typed wire struct, so any future field
+	// rename breaks here, not silently.
+	let typed = f
+		.admin
+		.get(format!("https://loupe-server/v1/jobs/{}", scan.job_id))
+		.send()
+		.await
+		.unwrap()
+		.json::<JobInfo>()
+		.await
+		.unwrap();
+	assert!(typed.partial);
+	assert!(!typed.continuation_stopped);
+	assert!(typed.finished_at.is_some());
+	assert!(typed.error.is_none());
+
+	// GET /v1/jobs — listing path must agree.
+	let listing: Vec<JobInfo> =
+		f.admin.get("https://loupe-server/v1/jobs").send().await.unwrap().json().await.unwrap();
+	let listed = listing.iter().find(|j| j.job_id == scan.job_id).expect("job present in listing");
+	assert!(listed.partial, "listing must also expose the partial flag");
+	assert!(!listed.continuation_stopped);
+
 	f.handle.shutdown().await;
 }

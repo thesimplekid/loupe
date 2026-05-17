@@ -43,12 +43,14 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/workers/{id}", delete(routes::workers::revoke))
 		.route("/v1/jobs", get(routes::jobs::list))
 		.route("/v1/jobs/{id}", get(routes::jobs::get))
+		.route("/v1/jobs/{id}/cancel", post(routes::jobs::cancel))
 		.route_layer(axum::middleware::from_fn(auth::require_admin));
 
 	let worker_only = Router::new()
 		.route("/v1/jobs/lease", post(routes::jobs::lease))
 		.route("/v1/jobs/{id}/heartbeat", post(routes::jobs::heartbeat))
 		.route("/v1/jobs/{id}/findings", post(routes::jobs::submit_findings))
+		.route("/v1/jobs/{id}/scan-progress", post(routes::jobs::report_scan_progress))
 		.route("/v1/jobs/{id}/verdict", post(routes::jobs::submit_verdict))
 		.route("/v1/jobs/{id}/complete", post(routes::jobs::complete))
 		.route_layer(axum::middleware::from_fn(auth::require_worker));
@@ -62,6 +64,9 @@ pub fn router(state: AppState) -> Router {
 		// `get_finding_by_id`) and the handlers enforce an active
 		// lease for the requested repo before returning finding data.
 		.route("/v1/repos/{id}/findings/search", get(routes::findings_admin::search))
+		// Workers reach this through the LLM scanner's resumable-scan
+		// pre-flight; the handler enforces an active lease for `:id`.
+		.route("/v1/repos/{id}/scan-progress", get(routes::jobs::list_scan_progress))
 		.route("/v1/findings/{id}", get(routes::findings_admin::get))
 		.route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::mtls_auth));
 

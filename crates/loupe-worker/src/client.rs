@@ -5,8 +5,8 @@
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
 	CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
-	LeaseRequest, LeaseResponse, ListFindingsResponse, VerdictSubmission, PROTOCOL_VERSION,
-	PROTOCOL_VERSION_HEADER,
+	LeaseRequest, LeaseResponse, ListFindingsResponse, ScanProgressList, ScanProgressReport,
+	VerdictSubmission, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 use reqwest::Url;
 
@@ -125,6 +125,43 @@ impl ServerClient {
 			self.with_protocol(self.http.get(url)).send().await.context("get_finding request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding finding detail")
+	}
+
+	/// Files already scanned for `(repo_id, commit)` — the worker
+	/// filters these out of its walk so a continuation doesn't re-spend
+	/// tokens on finished files. Best-effort at the call site: a failure
+	/// here must not block scanning (caller proceeds as if none done).
+	pub async fn scanned_files(&self, repo_id: i64, commit: &str) -> Result<Vec<String>> {
+		let url = self.url(&format!("/v1/repos/{repo_id}/scan-progress"));
+		let resp = self
+			.with_protocol(self.http.get(url).query(&[("commit", commit)]))
+			.send()
+			.await
+			.context("scan-progress list request")?;
+		ensure_ok(&resp)?;
+		let list: ScanProgressList = resp.json().await.context("decoding scan-progress list")?;
+		Ok(list.files)
+	}
+
+	/// Report files fully scanned at `commit` so a later continuation
+	/// can skip them. Best-effort: callers log and continue on error —
+	/// losing a progress report only costs a re-scan, never correctness.
+	pub async fn report_scan_progress(
+		&self, job_id: i64, commit: &str, files: Vec<String>,
+	) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/scan-progress"));
+		let req = ScanProgressReport {
+			protocol_version: PROTOCOL_VERSION,
+			commit_sha: commit.to_owned(),
+			files,
+		};
+		let resp = self
+			.with_protocol(self.http.post(url))
+			.json(&req)
+			.send()
+			.await
+			.context("scan-progress report request")?;
+		ensure_ok(&resp)
 	}
 
 	fn url(&self, path: &str) -> Url {

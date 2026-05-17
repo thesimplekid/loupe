@@ -5,6 +5,7 @@
 //! or verdicts, and completes the lease.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,15 +104,30 @@ impl Runner {
 		let _ = heartbeat.await;
 
 		match outcome {
-			Ok((head_sha, _findings_count)) => {
+			Ok((head_sha, _findings_count, partial, resume_not_before)) => {
+				// A rate-limited scan completes as Partial: the server
+				// keeps the (real) findings and the progress rows,
+				// leaves `last_scanned_sha` untouched, and auto-
+				// schedules a continuation. Anything else is a normal
+				// Succeeded — the commit was fully covered.
+				let (outcome, kind) = if partial {
+					(CompleteOutcome::Partial, "partial")
+				} else {
+					(CompleteOutcome::Succeeded, "succeeded")
+				};
+				// `resume_not_before` is only meaningful with Partial.
+				// Strip it on a clean Succeeded so a stale-but-harmless
+				// hint doesn't leak into the job row.
+				let resume_not_before = if partial { resume_not_before } else { None };
 				let req = CompleteRequest {
 					protocol_version: PROTOCOL_VERSION,
-					outcome: CompleteOutcome::Succeeded,
+					outcome,
 					head_sha: Some(head_sha),
 					error: None,
+					resume_not_before,
 				};
 				self.client.complete(job_id, &req).await?;
-				tracing::info!(job_id, "job succeeded");
+				tracing::info!(job_id, kind, "job completed");
 			},
 			Err(e) => {
 				tracing::warn!(job_id, error = %e, "job failed");
@@ -120,6 +136,7 @@ impl Runner {
 					outcome: CompleteOutcome::Failed,
 					head_sha: None,
 					error: Some(e.to_string()),
+					resume_not_before: None,
 				};
 				if let Err(ce) = self.client.complete(job_id, &req).await {
 					tracing::warn!(job_id, error = %ce, "complete(Failed) call failed too");
@@ -129,10 +146,15 @@ impl Runner {
 		Ok(())
 	}
 
-	/// Returns (head_sha, findings_count).
+	/// Returns (head_sha, findings_count, partial, resume_not_before).
+	/// `partial` is true only for a scan that stopped early on a
+	/// provider rate limit; verify jobs and fully-covered scans return
+	/// false. `resume_not_before` is the parsed reset-time hint (Unix
+	/// seconds) when present, used by the server scheduler to defer
+	/// the auto-continuation past the lockout window.
 	async fn execute(
 		&self, env: LeaseEnvelope, cancel: CancellationToken,
-	) -> Result<(String, usize)> {
+	) -> Result<(String, usize, bool, Option<i64>)> {
 		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
 		let ensured =
 			self.cache.ensure_repo(&key, &env.repo.clone_url, env.github_pat.as_deref()).await?;
@@ -203,7 +225,7 @@ impl Runner {
 						);
 					},
 				}
-				Ok((head_sha, 0))
+				Ok((head_sha, 0, false, None))
 			},
 			LeasePayload::Scan { since_sha } => {
 				tracing::info!(job_id = env.job_id, "checking out worktree");
@@ -230,6 +252,8 @@ impl Runner {
 					base_sha: since_sha,
 					config: env.scanner_config,
 					cancel: cancel.clone(),
+					rate_limited: Arc::new(AtomicBool::new(false)),
+					resume_at: Arc::new(AtomicI64::new(0)),
 				};
 
 				let mut all = Vec::new();
@@ -257,13 +281,31 @@ impl Runner {
 						},
 						Err(e) => tracing::warn!(scanner = s.id(), error = %e, "scanner failed"),
 					}
+					if ctx.rate_limited.load(Ordering::SeqCst) {
+						tracing::info!(
+							job_id = env.job_id,
+							scanner = s.id(),
+							"scan marked partial; skipping remaining scanners",
+						);
+						break;
+					}
 				}
 				if !all.is_empty() {
 					let batch =
 						FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all.clone() };
 					self.client.submit_findings(env.job_id, &batch).await?;
 				}
-				Ok((head_sha, all.len()))
+				// `scan()` raises this when a per-file session hit a
+				// provider rate limit. It means the commit is not fully
+				// covered ⇒ complete as Partial, not Succeeded.
+				let partial = ctx.rate_limited.load(Ordering::SeqCst);
+				let resume_at_raw = ctx.resume_at.load(Ordering::SeqCst);
+				// Sentinel 0 means "no hint observed" — keep it None so
+				// the server falls back to its static backoff rather
+				// than scheduling at epoch zero.
+				let resume_not_before =
+					if partial && resume_at_raw > 0 { Some(resume_at_raw) } else { None };
+				Ok((head_sha, all.len(), partial, resume_not_before))
 			},
 		}
 	}

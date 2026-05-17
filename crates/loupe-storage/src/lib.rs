@@ -11,6 +11,7 @@ pub mod findings;
 pub mod jobs;
 pub mod migrations;
 pub mod repos;
+pub mod scan_progress;
 pub mod secrets;
 pub mod workers;
 
