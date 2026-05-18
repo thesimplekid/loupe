@@ -44,6 +44,14 @@ pub struct ScanProgressList {
 	pub files: Vec<String>,
 }
 
+/// Body of `POST /v1/jobs/:id/retry` (admin). Empty today apart from
+/// the protocol guard; kept as a DTO so the route can grow options
+/// without changing shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryJobRequest {
+	pub protocol_version: u16,
+}
+
 /// Body of `POST /v1/jobs/:id/verdict` (worker, verify-kind only). One
 /// verdict per verify job — that's the entire reason to split the
 /// endpoint from `findings`.

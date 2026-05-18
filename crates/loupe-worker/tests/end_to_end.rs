@@ -16,7 +16,7 @@ use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
 use loupe_tls::Ca;
 use loupe_worker::scanners::RegexSecretsScanner;
-use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
+use loupe_worker::{RepoCache, Runner, ScanContext, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
 fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
@@ -49,6 +49,23 @@ fn make_planted_repo() -> (tempfile::TempDir, String) {
 	repo.commit(Some("HEAD"), &sig, &sig, "plant", &tree, &[]).unwrap();
 	let url = format!("file://{}", tmp.path().display());
 	(tmp, url)
+}
+
+struct FailingScanner;
+
+#[async_trait::async_trait]
+impl Scanner for FailingScanner {
+	fn id(&self) -> &'static str {
+		"failing-scanner"
+	}
+
+	fn capabilities(&self) -> &[&'static str] {
+		&["scan:failing"]
+	}
+
+	async fn scan(&self, _: &ScanContext) -> anyhow::Result<Vec<loupe_core::Finding>> {
+		anyhow::bail!("synthetic scanner failure")
+	}
 }
 
 #[tokio::test]
@@ -186,6 +203,132 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 		})
 		.unwrap();
 	assert!(head_sha.is_some(), "head_sha should have been persisted on success");
+
+	server_handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_marks_job_failed_when_scanner_fails() {
+	let (_repo_tmp, clone_url) = make_planted_repo();
+	let server_dir = tempfile::tempdir().unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
+
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
+		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	)
+	.unwrap();
+	let server_cert_pem = std::fs::read_to_string(&init.layout.server_cert).unwrap();
+	let server_key_pem = std::fs::read_to_string(&init.layout.server_key).unwrap();
+	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let ca_key_pem = std::fs::read_to_string(&init.layout.ca_key).unwrap();
+
+	let cfg = Config {
+		bind_addr: "127.0.0.1:0".parse().unwrap(),
+		db_path: init.layout.db_path.clone(),
+		server_cert_pem,
+		server_key_pem,
+		ca_cert_pem: ca_cert_pem.clone(),
+		ca_key_pem,
+	};
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let state = AppState::new(
+		db.clone(),
+		Arc::new(ca),
+		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
+	);
+	let server_handle = serve(cfg, state).await.unwrap();
+	let addr: SocketAddr = server_handle.local_addr;
+
+	let admin = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+
+	let resp = admin
+		.post("https://loupe-server/v1/repos")
+		.json(&RegisterRepoRequest {
+			protocol_version: PROTOCOL_VERSION,
+			clone_url: "https://github.com/loupe/test-target.git".into(),
+			branch: None,
+			scan_interval_seconds: None,
+			reporting: ReportingSetup::GithubIssue {
+				target_owner: "x".into(),
+				target_repo: "y".into(),
+				github_pat: "ghp".into(),
+			},
+			scanner_config: serde_json::Value::Null,
+			verification_enabled: Some(false),
+			require_approval: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let body: serde_json::Value = resp.json().await.unwrap();
+	let repo_id = body["repo_id"].as_i64().unwrap();
+
+	db.with_conn(|c| {
+		c.execute(
+			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
+			(&clone_url, repo_id),
+		)?;
+		Ok(())
+	})
+	.unwrap();
+
+	let resp = admin
+		.post("https://loupe-server/v1/workers")
+		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: "w1".into() })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
+
+	let raw = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+	let server_client =
+		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
+
+	let resp = admin
+		.post(format!("https://loupe-server/v1/repos/{}/scan", repo_id))
+		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(FailingScanner)];
+	let runner = Runner::new(server_client, cache, scanners);
+
+	let cancel = CancellationToken::new();
+	let stepped = runner.step(&cancel).await.unwrap();
+	assert!(stepped, "runner should have leased and run the queued job");
+
+	let (state, error, head_sha): (String, Option<String>, Option<String>) = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT state, error, head_sha FROM jobs LIMIT 1", [], |r| {
+				Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+			})?)
+		})
+		.unwrap();
+	assert_eq!(state, "failed");
+	assert!(head_sha.is_some(), "failed scanner jobs should retain their checked-out head");
+	assert!(
+		error.as_deref().is_some_and(|e| e.contains("scanner failing-scanner failed")),
+		"unexpected job error: {error:?}"
+	);
 
 	server_handle.shutdown().await;
 }

@@ -107,6 +107,7 @@ mod tests {
 						kind: loupe_core::JobKind::Scan,
 						incremental: false,
 						since_sha: None,
+						head_sha: None,
 						parent_job_id: None,
 						target_finding_id: None,
 					},

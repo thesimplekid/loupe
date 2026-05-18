@@ -60,6 +60,10 @@ pub enum LeasePayload {
 	Scan {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		since_sha: Option<String>,
+		/// Optional pinned commit for a retried scan. Normal scans
+		/// omit this and use the repo's configured branch.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		target_sha: Option<String>,
 	},
 	Verify {
 		finding_id: i64,
@@ -105,7 +109,10 @@ mod tests {
 			lease_expires_at: 1_700_000_600,
 			scanner_config: json!({"regex": {"enabled": true}}),
 			github_pat: None,
-			payload: LeasePayload::Scan { since_sha: Some("abc123".into()) },
+			payload: LeasePayload::Scan {
+				since_sha: Some("abc123".into()),
+				target_sha: Some("def456".into()),
+			},
 		};
 		let r = LeaseResponse::Lease(Box::new(env.clone()));
 		let s = serde_json::to_string(&r).unwrap();

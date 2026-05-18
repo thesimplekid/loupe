@@ -16,7 +16,7 @@ mod version;
 pub use findings_admin::{FindingDetail, FindingSummary, ListFindingsResponse};
 pub use job_io::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
-	ScanProgressList, ScanProgressReport, VerdictSubmission,
+	RetryJobRequest, ScanProgressList, ScanProgressReport, VerdictSubmission,
 };
 pub use lease::{LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse};
 pub use registry::{

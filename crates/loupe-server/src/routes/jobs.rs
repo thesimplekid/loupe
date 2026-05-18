@@ -24,8 +24,8 @@ use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatRequest, HeartbeatResponse, JobInfo,
-	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ScanProgressList, ScanProgressReport,
-	ScanRequest, ScanResponse, VerdictSubmission, PROTOCOL_VERSION,
+	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, RetryJobRequest, ScanProgressList,
+	ScanProgressReport, ScanRequest, ScanResponse, VerdictSubmission, PROTOCOL_VERSION,
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, scan_progress, secrets};
@@ -96,6 +96,7 @@ pub async fn enqueue_scan(
 					kind: JobKind::Scan,
 					incremental: req.incremental,
 					since_sha,
+					head_sha: None,
 					parent_job_id: None,
 					target_finding_id: None,
 				},
@@ -164,6 +165,52 @@ pub async fn cancel(
 		},
 		_ => Err((StatusCode::CONFLICT, "job is already terminal".into())),
 	}
+}
+
+/// `POST /v1/jobs/:id/retry` — admin restarts a failed scan using the
+/// same scan window (`incremental` + `since_sha`) as the failed job.
+/// This is deliberately explicit rather than automatic: auth/sandbox
+/// failures should not spin forever, but after an operator fixes the
+/// root cause they can restart from the original boundary.
+pub async fn retry(
+	State(state): State<AppState>, Path(id): Path<i64>, Json(req): Json<RetryJobRequest>,
+) -> Result<(StatusCode, Json<ScanResponse>), (StatusCode, String)> {
+	check_version(req.protocol_version)?;
+	let now = now_secs();
+
+	let job = state
+		.db
+		.with_conn(|c| Ok(jobs::get(c, id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get job: {e}")))?
+		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no job with id {id}")))?;
+	if job.kind != JobKind::Scan {
+		return Err((StatusCode::CONFLICT, "only scan jobs can be retried".into()));
+	}
+	if job.state != JobState::Failed {
+		return Err((StatusCode::CONFLICT, "only failed scan jobs can be retried".into()));
+	}
+
+	let job_id = state
+		.db
+		.with_conn(|c| {
+			Ok(jobs::enqueue(
+				c,
+				&NewJob {
+					repo_id: job.repo_id,
+					kind: JobKind::Scan,
+					incremental: job.incremental,
+					since_sha: job.since_sha.clone(),
+					head_sha: job.head_sha.clone(),
+					parent_job_id: Some(job.id),
+					target_finding_id: None,
+				},
+				now,
+			)?)
+		})
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue retry: {e}")))?;
+
+	state.job_arrived.notify_waiters();
+	Ok((StatusCode::CREATED, Json(ScanResponse { protocol_version: PROTOCOL_VERSION, job_id })))
 }
 
 /// Maximum wait the server will honour on a single long-poll, even if
@@ -256,7 +303,10 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 	let github_pat: Option<String> = None;
 
 	let payload = match row.kind {
-		JobKind::Scan => LeasePayload::Scan { since_sha: row.since_sha.clone() },
+		JobKind::Scan => LeasePayload::Scan {
+			since_sha: row.since_sha.clone(),
+			target_sha: row.head_sha.clone(),
+		},
 		JobKind::Verify => {
 			let target_id = row
 				.target_finding_id

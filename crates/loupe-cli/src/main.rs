@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RotateRepoPatRequest, ScanRequest, ScanResponse, SetRepoGithubReportingRequest,
-	UpdateRepoRequest, PROTOCOL_VERSION,
+	RetryJobRequest, RotateRepoPatRequest, ScanRequest, ScanResponse,
+	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -228,6 +228,10 @@ enum JobCmd {
 	Cancel {
 		id: i64,
 	},
+	/// Restart a failed scan with the same original scan window.
+	Retry {
+		id: i64,
+	},
 }
 
 #[derive(Debug, Subcommand)]
@@ -352,6 +356,10 @@ async fn main() -> Result<()> {
 			JobCmd::Cancel { id } => {
 				let (client, base) = client_and_url(&conn)?;
 				job_cancel(&client, base, id).await
+			},
+			JobCmd::Retry { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				job_retry(&client, base, id).await
 			},
 		},
 		Cmd::Finding(c) => match c {
@@ -773,6 +781,17 @@ async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> R
 	let resp = client.post(url(base, &format!("/v1/jobs/{id}/cancel"))).send().await?;
 	ensure_ok(resp).await?;
 	println!("cancelled job {id}");
+	Ok(())
+}
+
+async fn job_retry(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client
+		.post(url(base, &format!("/v1/jobs/{id}/retry")))
+		.json(&RetryJobRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await?;
+	let body: ScanResponse = ensure_ok(resp).await?.json().await?;
+	println!("job_id={}", body.job_id);
 	Ok(())
 }
 

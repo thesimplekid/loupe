@@ -20,6 +20,24 @@ use crate::client::ServerClient;
 use crate::repo_cache::{RepoCache, RepoKey};
 use crate::scanner::{ScanContext, Scanner, VerifyContext};
 
+#[derive(Debug)]
+struct FailedAfterCheckout {
+	head_sha: String,
+	source: anyhow::Error,
+}
+
+impl std::fmt::Display for FailedAfterCheckout {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.source)
+	}
+}
+
+impl std::error::Error for FailedAfterCheckout {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		self.source.source()
+	}
+}
+
 /// How often the runner heartbeat-pings during a long scan.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Long-poll budget on `POST /v1/jobs/lease`. Tuned just under the
@@ -130,11 +148,12 @@ impl Runner {
 				tracing::info!(job_id, kind, "job completed");
 			},
 			Err(e) => {
+				let head_sha = e.downcast_ref::<FailedAfterCheckout>().map(|e| e.head_sha.clone());
 				tracing::warn!(job_id, error = %e, "job failed");
 				let req = CompleteRequest {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Failed,
-					head_sha: None,
+					head_sha,
 					error: Some(e.to_string()),
 					resume_not_before: None,
 				};
@@ -165,7 +184,7 @@ impl Runner {
 
 		match env.payload {
 			LeasePayload::Verify { finding_id, finding } => {
-				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
+				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref(), None).await?;
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
@@ -227,9 +246,10 @@ impl Runner {
 				}
 				Ok((head_sha, 0, false, None))
 			},
-			LeasePayload::Scan { since_sha } => {
+			LeasePayload::Scan { since_sha, target_sha } => {
 				tracing::info!(job_id = env.job_id, "checking out worktree");
-				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
+				let (workdir, head_sha) =
+					checkout(&bare, env.head_branch.as_deref(), target_sha.as_deref()).await?;
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				tracing::info!(
 					job_id = env.job_id,
@@ -279,7 +299,23 @@ impl Runner {
 							);
 							all.append(&mut findings);
 						},
-						Err(e) => tracing::warn!(scanner = s.id(), error = %e, "scanner failed"),
+						Err(e) => {
+							tracing::warn!(scanner = s.id(), error = %e, "scanner failed");
+							if ctx.rate_limited.load(Ordering::SeqCst) {
+								tracing::info!(
+									job_id = env.job_id,
+									scanner = s.id(),
+									"scan marked partial after scanner error; skipping remaining scanners",
+								);
+								break;
+							}
+							let error = e.context(format!("scanner {} failed", s.id()));
+							return Err(FailedAfterCheckout {
+								head_sha: head_sha.clone(),
+								source: error,
+							}
+							.into());
+						},
 					}
 					if ctx.rate_limited.load(Ordering::SeqCst) {
 						tracing::info!(
@@ -329,28 +365,39 @@ impl Runner {
 	}
 }
 
-/// Produce a fresh worktree from the bare clone at `bare` checked out
-/// to `branch` (or the default branch if `None`). Returns the worktree
-/// dir (a `TempDir` for cleanup) plus the resolved commit SHA.
-pub async fn checkout(bare: &Path, branch: Option<&str>) -> Result<(tempfile::TempDir, String)> {
+/// Produce a fresh worktree from the bare clone at `bare`. When
+/// `target_sha` is provided the checkout is pinned to that commit;
+/// otherwise it uses `branch` (or the default branch if `None`).
+/// Returns the worktree dir (a `TempDir` for cleanup) plus the
+/// resolved commit SHA.
+pub async fn checkout(
+	bare: &Path, branch: Option<&str>, target_sha: Option<&str>,
+) -> Result<(tempfile::TempDir, String)> {
 	let bare = bare.to_path_buf();
 	let branch = branch.map(|s| s.to_owned());
+	let target_sha = target_sha.map(|s| s.to_owned());
 	let tmp = tempfile::tempdir().context("creating temp worktree dir")?;
 	let workdir = tmp.path().to_path_buf();
 	let head_sha = tokio::task::spawn_blocking(move || -> Result<String> {
 		let repo = git2::Repository::open_bare(&bare)
 			.with_context(|| format!("opening bare repo at {}", bare.display()))?;
-		let target_ref = match branch.as_deref() {
-			Some(b) => repo
-				.find_reference(&format!("refs/heads/{b}"))
-				.or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{b}")))
-				.with_context(|| format!("locating ref for branch {b}"))?,
-			None => repo
-				.find_reference("HEAD")
-				.or_else(|_| repo.find_reference("refs/remotes/origin/HEAD"))
-				.context("locating HEAD reference")?,
+		let commit = if let Some(sha) = target_sha.as_deref() {
+			let oid =
+				git2::Oid::from_str(sha).with_context(|| format!("parsing target sha {sha}"))?;
+			repo.find_commit(oid).with_context(|| format!("locating target commit {sha}"))?
+		} else {
+			let target_ref = match branch.as_deref() {
+				Some(b) => repo
+					.find_reference(&format!("refs/heads/{b}"))
+					.or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{b}")))
+					.with_context(|| format!("locating ref for branch {b}"))?,
+				None => repo
+					.find_reference("HEAD")
+					.or_else(|_| repo.find_reference("refs/remotes/origin/HEAD"))
+					.context("locating HEAD reference")?,
+			};
+			target_ref.peel_to_commit().context("resolving ref to commit")?
 		};
-		let commit = target_ref.peel_to_commit().context("resolving ref to commit")?;
 		let tree = commit.tree().context("resolving commit tree")?;
 		let mut opts = git2::build::CheckoutBuilder::new();
 		opts.target_dir(&workdir).recreate_missing(true).force();

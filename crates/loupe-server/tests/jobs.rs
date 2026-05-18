@@ -10,7 +10,8 @@ use loupe_core::{Finding, Severity};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, LeaseEnvelope, LeaseRequest,
 	LeaseResponse, ListFindingsResponse, RegisterRepoRequest, RegisterWorkerRequest,
-	RegisterWorkerResponse, ReportingSetup, ScanRequest, ScanResponse, PROTOCOL_VERSION,
+	RegisterWorkerResponse, ReportingSetup, RetryJobRequest, ScanRequest, ScanResponse,
+	PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
@@ -309,6 +310,76 @@ async fn end_to_end_scan_lifecycle() {
 		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM scan_history", [], |r| r.get(0))?))
 			.unwrap();
 	assert_eq!(history_count, 1);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_failed_scan_preserves_original_window() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		c.execute(
+			"UPDATE registered_repos SET last_scanned_sha = 'base123' WHERE id = ?1",
+			[f.repo_id],
+		)?;
+		Ok(())
+	})
+	.unwrap();
+
+	let resp = f
+		.admin
+		.post(format!("https://loupe-server/v1/repos/{}/scan", f.repo_id))
+		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: true })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let scan: ScanResponse = resp.json().await.unwrap();
+
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.job_id, scan.job_id);
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: Some("head456".into()),
+			error: Some("synthetic failure".into()),
+			resume_not_before: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let resp = f
+		.admin
+		.post(format!("https://loupe-server/v1/jobs/{}/retry", scan.job_id))
+		.json(&RetryJobRequest { protocol_version: PROTOCOL_VERSION })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let retry: ScanResponse = resp.json().await.unwrap();
+
+	let retried =
+		f.db.with_conn(|c| Ok(loupe_storage::jobs::get(c, retry.job_id)?)).unwrap().unwrap();
+	assert_eq!(retried.parent_job_id, Some(scan.job_id));
+	assert!(retried.incremental);
+	assert_eq!(retried.since_sha.as_deref(), Some("base123"));
+	assert_eq!(retried.head_sha.as_deref(), Some("head456"));
+
+	let retry_env = lease_job(&f.worker).await;
+	assert_eq!(retry_env.job_id, retry.job_id);
+	match retry_env.payload {
+		loupe_proto::LeasePayload::Scan { since_sha, target_sha } => {
+			assert_eq!(since_sha.as_deref(), Some("base123"));
+			assert_eq!(target_sha.as_deref(), Some("head456"));
+		},
+		_ => panic!("expected scan lease"),
+	}
 
 	f.handle.shutdown().await;
 }
