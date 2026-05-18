@@ -20,6 +20,8 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -35,6 +37,10 @@ use crate::sandbox::SandboxBuilder;
 
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
+const AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTH_REFRESH_PROMPT: &str = "Reply with OK.";
+
+static AUTH_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Fixed sandbox path for the per-call MCP config file claude reads.
 /// The host-side scratch dir (a `tempfile::TempDir`) bind-mounts
@@ -120,6 +126,13 @@ fn truncate(s: &str, n: usize) -> String {
 	buf.replace('\n', " ")
 }
 
+fn is_claude_auth_error(error: &anyhow::Error) -> bool {
+	let msg = error.to_string().to_ascii_lowercase();
+	msg.contains("401")
+		&& (msg.contains("invalid authentication credentials")
+			|| msg.contains("failed to authenticate"))
+}
+
 pub struct ClaudeCliBackend {
 	bin: String,
 	mcp: Option<McpContext>,
@@ -142,21 +155,71 @@ impl ClaudeCliBackend {
 		self.mcp = Some(mcp);
 		self
 	}
-}
 
-impl Default for ClaudeCliBackend {
-	fn default() -> Self {
-		Self::new()
+	async fn refresh_auth_on_host(&self) -> Result<()> {
+		let lock = AUTH_REFRESH_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+		let _guard = lock.lock().await;
+		tracing::warn!(
+			backend = BACKEND_ID,
+			timeout_ms = AUTH_REFRESH_TIMEOUT.as_millis() as u64,
+			"claude-cli: auth failed in sandbox; running host-side refresh probe",
+		);
+
+		let mut child = tokio::process::Command::new(&self.bin)
+			.arg("-p")
+			.arg(AUTH_REFRESH_PROMPT)
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.with_context(|| format!("spawning `{}` for host-side auth refresh probe", self.bin))?;
+
+		let stdout_handle = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+		let stderr_handle = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+		let (status, stdout, stderr) = match timeout(AUTH_REFRESH_TIMEOUT, async {
+			let mut stdout_buf = Vec::new();
+			let mut stderr_buf = Vec::new();
+			let mut so = stdout_handle;
+			let mut se = stderr_handle;
+			let (status, _, _) = tokio::join!(
+				child.wait(),
+				so.read_to_end(&mut stdout_buf),
+				se.read_to_end(&mut stderr_buf),
+			);
+			Result::<_>::Ok((status?, stdout_buf, stderr_buf))
+		})
+		.await
+		{
+			Ok(inner) => inner?,
+			Err(_) => {
+				let _ = child.kill().await;
+				return Err(anyhow!(
+					"claude host-side auth refresh probe timed out after {:?}",
+					AUTH_REFRESH_TIMEOUT
+				));
+			},
+		};
+
+		if !status.success() {
+			let stderr_text = String::from_utf8_lossy(&stderr);
+			let stdout_text = String::from_utf8_lossy(&stdout);
+			let combined = format!(
+				"stderr=`{}` stdout=`{}`",
+				truncate(&stderr_text, 400),
+				truncate(&stdout_text, 400),
+			);
+			return Err(anyhow!(
+				"claude host-side auth refresh probe exited with {}: {}",
+				status,
+				combined
+			));
+		}
+
+		tracing::info!(backend = BACKEND_ID, "claude-cli: host-side auth refresh probe succeeded");
+		Ok(())
 	}
-}
 
-#[async_trait]
-impl LlmBackend for ClaudeCliBackend {
-	fn id(&self) -> &'static str {
-		BACKEND_ID
-	}
-
-	async fn run(&self, req: LlmRequest) -> Result<LlmResponse> {
+	async fn run_sandboxed(&self, req: LlmRequest) -> Result<LlmResponse> {
 		tracing::debug!(
 			backend = BACKEND_ID,
 			workdir = %req.workdir.display(),
@@ -329,6 +392,39 @@ impl LlmBackend for ClaudeCliBackend {
 	}
 }
 
+impl Default for ClaudeCliBackend {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+#[async_trait]
+impl LlmBackend for ClaudeCliBackend {
+	fn id(&self) -> &'static str {
+		BACKEND_ID
+	}
+
+	async fn run(&self, req: LlmRequest) -> Result<LlmResponse> {
+		let first_err = match self.run_sandboxed(req.clone()).await {
+			Ok(resp) => return Ok(resp),
+			Err(e) if is_claude_auth_error(&e) => e,
+			Err(e) => return Err(e),
+		};
+
+		if let Err(refresh_err) = self.refresh_auth_on_host().await {
+			tracing::warn!(
+				backend = BACKEND_ID,
+				error = %refresh_err,
+				"claude-cli: host-side auth refresh probe failed",
+			);
+			return Err(first_err);
+		}
+
+		tracing::info!(backend = BACKEND_ID, "claude-cli: retrying after host-side auth refresh");
+		self.run_sandboxed(req).await
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;
@@ -355,6 +451,20 @@ mod tests {
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
+	}
+
+	#[test]
+	fn auth_error_detection_matches_claude_401_output() {
+		let err = anyhow!(
+			"claude CLI exited with exit status: 1: stderr=`` stdout=`Failed to authenticate. API Error: 401 Invalid authentication credentials `"
+		);
+		assert!(is_claude_auth_error(&err));
+	}
+
+	#[test]
+	fn auth_error_detection_ignores_other_failures() {
+		let err = anyhow!("claude CLI timed out after 60s");
+		assert!(!is_claude_auth_error(&err));
 	}
 
 	#[tokio::test]
